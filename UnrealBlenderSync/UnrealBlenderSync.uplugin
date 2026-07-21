@@ -1,0 +1,22 @@
+{
+  "FileVersion": 3,
+  "Version": 1,
+  "VersionName": "1.0",
+  "FriendlyName": "Unreal Blender Sync",
+  "Description": "Minimal console command for exporting assets to Blender.",
+  "Category": "Editor",
+  "CreatedBy": "sassy",
+  "CreatedByURL": "",
+  "DocsURL": "",
+  "MarketplaceURL": "",
+  "SupportURL": "",
+  "EngineVersion": "5.8.0",
+  "Modules": [
+    {
+      "Name": "UnrealBlenderSync",
+      "Type": "Runtime",
+      "LoadingPhase": "Default",
+      "AdditionalDependencies": [ "Engine", "UnrealEd" ]
+    }
+  ]
+}

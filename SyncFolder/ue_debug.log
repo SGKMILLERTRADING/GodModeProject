@@ -1,0 +1,6 @@
+Starting export_texture2d test
+Created RT
+Spawned capture actor: <Object '/Game/ChangingRoom.ChangingRoom:PersistentLevel.SceneCapture2D_5' (0x0000018F8E3CC300) Class 'SceneCapture2D'>
+Component: <Object '/Game/ChangingRoom.ChangingRoom:PersistentLevel.SceneCapture2D_5.NewSceneCaptureComponent2D' (0x0000018FDDA37E00) Class 'SceneCaptureComponent2D'>
+Captured scene
+Created static tex: None

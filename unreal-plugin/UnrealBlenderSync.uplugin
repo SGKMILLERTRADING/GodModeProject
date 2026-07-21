@@ -1,0 +1,12 @@
+{
+    "FileVersion": 3,
+    "Version": 1,
+    "VersionName": "1.0",
+    "FriendlyName": "Unreal-Blender Sync",
+    "Description": "UE5.8 plugin scaffold for one-click export/import of skeletal meshes, hair, materials, skinning, and animation to Blender.",
+    "Category": "Importers",
+    "CreatedBy": "GitHub Copilot",
+    "CreatedByURL": "https://github.com/github-copilot",
+    "EnabledByDefault": true,
+    "CanContainContent": true
+}
