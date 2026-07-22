@@ -82,7 +82,7 @@ def server_loop():
 def process_execution_queue():
     """Timer callback to process queued commands in Blender's main thread."""
     if not is_running:
-        return None
+        return 0.1
         
     try:
         while True:
@@ -1156,11 +1156,13 @@ def start_server():
     if is_running:
         return
         
+    is_running = True
     server_thread = threading.Thread(target=server_loop)
     server_thread.daemon = True
     server_thread.start()
     
-    bpy.app.timers.register(process_execution_queue)
+    if not bpy.app.timers.is_registered(process_execution_queue):
+        bpy.app.timers.register(process_execution_queue, persistent=True)
 
 def stop_server():
     """Stops the background socket server."""
@@ -1191,13 +1193,15 @@ class UBSyncAIBridgeOperator(bpy.types.Operator):
             self.report({'INFO'}, "AI Bridge stopped.")
         else:
             start_server()
-            self.report({'INFO'}, "AI Bridge started on port 12345. Run mcp_server.py in terminal.")
+            self.report({'INFO'}, "AI Bridge started on port 12345.")
             
         return {'FINISHED'}
 
 def register():
-    # Auto-start the AI Bridge server so Claude/MCP can connect immediately
-    import bpy
+    # Register main-thread processing timer persistently
+    if not bpy.app.timers.is_registered(process_execution_queue):
+        bpy.app.timers.register(process_execution_queue, persistent=True)
+    
     def _delayed_start():
         try:
             start_server()
@@ -1205,7 +1209,9 @@ def register():
         except Exception as e:
             print(f"AI Bridge: Auto-start failed: {e}")
         return None  # Don't repeat
-    bpy.app.timers.register(_delayed_start, first_interval=2.0)
+        
+    bpy.app.timers.register(_delayed_start, first_interval=1.0)
 
 def unregister():
     stop_server()
+
