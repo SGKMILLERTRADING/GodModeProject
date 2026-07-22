@@ -1,30 +1,27 @@
 """
-Unreal Socket Server
---------------------
-Run this script with Python BEFORE starting your AI client.
-It listens on port 8000 for MCP bridge requests, then forwards them
-to Unreal Engine's built-in Remote Control API (port 30010).
+Unreal Actions Module
+---------------------
+Shared module that handles all Unreal Engine actions directly via HTTP to the
+Remote Control API (port 30010). This replaces the old unreal_socket_server.py
+middleman.
 
-HOW TO START:
-    python unreal_socket_server.py
-
-REQUIREMENTS:
-    1. Unreal Engine must be open
-    2. In Unreal: Edit -> Plugins -> search "Remote Control API" -> Enable -> Restart UE
-    3. This script must be running before the AI client makes tool calls
-
-Nothing else needs to be compiled or installed.
+Usage:
+    from unreal_actions import handle_action
+    result = handle_action({"action": "get_actor_hierarchy", ...})
 """
 
-import socket
 import json
-import threading
-import http.client
 import os
-import sys
+import socket
+import http.client
 import configparser
+import glob
+import shutil
+import base64
+import time
 
 CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "UnrealMCPConfig.ini")
+
 
 def load_config():
     config = configparser.ConfigParser()
@@ -48,26 +45,14 @@ def load_config():
         config.read(CONFIG_FILE)
     return config
 
+
 _config = load_config()
 
-# ── Configuration ─────────────────────────────────────────────────────────────
-LISTEN_HOST  = _config.get("Settings", "ListenHost", fallback="127.0.0.1")
-LISTEN_PORT  = _config.getint("Settings", "ListenPort", fallback=8001)
-AUTH_TOKEN   = _config.get("Settings", "AuthToken", fallback="d9a7f3e8b6c04a92a5f2e1c4b9d7e3a1")
-
-UNREAL_HOST  = _config.get("Settings", "UnrealHost", fallback="127.0.0.1")
-UNREAL_PORT  = _config.getint("Settings", "UnrealPort", fallback=30010)
-
-DROPBOX_PATH = _config.get("Settings", "DropboxPath", fallback=r"C:\Dropbox")
-GDRIVE1_MESHES = _config.get("Settings", "GDrive1_Meshes", fallback=r"G:\My Drive\Meshes")
-GDRIVE2_SKINS = _config.get("Settings", "GDrive2_Skins", fallback=r"G:\My Drive\Skins")
-GDRIVE3_ANIMS = _config.get("Settings", "GDrive3_Anims", fallback=r"G:\My Drive\Anims")
-GDRIVE4_AUDIO = _config.get("Settings", "GDrive4_Audio", fallback=r"G:\My Drive\Audio")
-ASSET_LIBRARY_PATH = _config.get("Settings", "AssetLibraryPath", fallback=r"C:\Assets")
-
-SYNC_FOLDER  = os.path.join(os.path.dirname(os.path.abspath(__file__)), "SyncFolder")
-os.makedirs(SYNC_FOLDER, exist_ok=True)
-# ─────────────────────────────────────────────────────────────────────────────
+UNREAL_HOST = _config.get("Settings", "UnrealHost", fallback="127.0.0.1")
+UNREAL_PORT = _config.getint("Settings", "UnrealPort", fallback=30010)
+AUTH_TOKEN = _config.get("Settings", "AuthToken", fallback="d9a7f3e8b6c04a92a5f2e1c4b9d7e3a1")
+SYNC_FOLDER = os.path.join(os.path.dirname(os.path.abspath(__file__)), "SyncFolder")
+SYNC_FOLDER_FWD = SYNC_FOLDER.replace(chr(92), '/')
 
 
 def unreal_remote(endpoint: str, payload: dict) -> dict:
@@ -98,6 +83,7 @@ def unreal_remote(endpoint: str, payload: dict) -> dict:
 
 def _exec_ue_script(script: str, action_name: str) -> dict:
     """Write a Python script to the sync folder and execute it inside Unreal."""
+    os.makedirs(SYNC_FOLDER, exist_ok=True)
     temp_file = os.path.join(SYNC_FOLDER, f"temp_{action_name}.py")
     try:
         with open(temp_file, "w", encoding="utf-8") as f:
@@ -121,8 +107,8 @@ def _exec_ue_script(script: str, action_name: str) -> dict:
 def handle_action(req: dict) -> dict:
     """Dispatch an MCP action to Unreal or the sync folder."""
     action = req.get("action", "")
+    os.makedirs(SYNC_FOLDER, exist_ok=True)
 
-    # ── Actor hierarchy ───────────────────────────────────────────────────────
     if action == "get_actor_hierarchy":
         ue_script = f"""import unreal, json
 actors = unreal.EditorLevelLibrary.get_all_level_actors()
@@ -136,7 +122,7 @@ for a in actors:
             "class": a.get_class().get_name(),
             "location": {{"x": loc.x, "y": loc.y, "z": loc.z}}
         }})
-out_path = "{SYNC_FOLDER.replace('\\\\', '/')}/actor_hierarchy.json"
+out_path = f"{SYNC_FOLDER_FWD}/actor_hierarchy.json"
 with open(out_path, "w", encoding="utf-8") as f:
     json.dump(out, f)
 """
@@ -156,12 +142,11 @@ with open(out_path, "w", encoding="utf-8") as f:
         })
         return result
 
-    # ── Create actor ─────────────────────────────────────────────────────────
     elif action == "create_actor":
         actor_class = req.get("class", "StaticMeshActor")
         name = req.get("name", "NewActor")
         loc = req.get("location", {"x": 0, "y": 0, "z": 0})
-        
+
         ue_script = f"""import unreal
 cls_name = "{actor_class}"
 if "." not in cls_name and "/" not in cls_name:
@@ -186,7 +171,6 @@ else:
 """
         return _exec_ue_script(ue_script, "create_actor")
 
-    # ── Delete actor ─────────────────────────────────────────────────────────
     elif action == "delete_actor":
         name = req.get("name", "")
         ue_script = f"""import unreal
@@ -201,19 +185,18 @@ unreal.log(f"delete_actor: Destroyed {{destroyed_count}} actor(s) matching {{tar
 """
         return _exec_ue_script(ue_script, "delete_actor")
 
-    # ── Set transform ─────────────────────────────────────────────────────────
     elif action == "set_transform":
         name = req.get("name", "")
         transform = req.get("transform", {})
         x = transform.get("x", transform.get("X", 0))
         y = transform.get("y", transform.get("Y", 0))
         z = transform.get("z", transform.get("Z", 0))
-        
+
         rot = transform.get("rotation", transform.get("rot", {}))
         pitch = rot.get("pitch", rot.get("Pitch", transform.get("pitch", 0)))
         yaw = rot.get("yaw", rot.get("Yaw", transform.get("yaw", 0)))
         roll = rot.get("roll", rot.get("Roll", transform.get("roll", 0)))
-        
+
         scale = transform.get("scale", transform.get("scl", {}))
         if isinstance(scale, (int, float)):
             sx, sy, sz = scale, scale, scale
@@ -241,10 +224,9 @@ if not found:
 """
         return _exec_ue_script(ue_script, "set_transform")
 
-    # ── Run console command ───────────────────────────────────────────────────
     elif action == "run_editor_command":
         command = req.get("command", "")
-        result  = unreal_remote("/remote/object/call", {
+        result = unreal_remote("/remote/object/call", {
             "objectPath": "/Script/Engine.Default__KismetSystemLibrary",
             "functionName": "ExecuteConsoleCommand",
             "parameters": {
@@ -254,11 +236,10 @@ if not found:
         })
         return result
 
-    # ── Get Actor Property ───────────────────────────────────────────────────
     elif action == "get_actor_property":
         object_path = req.get("objectPath", req.get("name", ""))
         property_name = req.get("propertyName", "")
-        
+
         ue_script = f"""import unreal, json
 target_name = "{object_path}"
 prop_name = "{property_name}"
@@ -291,7 +272,7 @@ if target_actor:
     except Exception as e:
         unreal.log_warning(f"get_actor_property error: {{e}}")
 
-out_path = "{SYNC_FOLDER.replace('\\\\', '/')}/prop_result.json"
+out_path = f"{SYNC_FOLDER_FWD}/prop_result.json"
 with open(out_path, "w", encoding="utf-8") as f:
     json.dump({{"property": prop_name, "value": val_str}}, f)
 """
@@ -310,14 +291,13 @@ with open(out_path, "w", encoding="utf-8") as f:
             "propertyName": property_name
         })
 
-    # ── Set Actor Property ───────────────────────────────────────────────────
     elif action == "set_actor_property":
         object_path = req.get("objectPath", req.get("name", ""))
         property_name = req.get("propertyName", "")
         property_value = req.get("propertyValue", None)
-        
+
         val_str = json.dumps(property_value)
-        
+
         ue_script = f"""import unreal, json
 target_name = "{object_path}"
 prop_name = "{property_name}"
@@ -354,7 +334,6 @@ else:
 """
         return _exec_ue_script(ue_script, "set_actor_property")
 
-    # ── Call Blueprint Function ──────────────────────────────────────────────
     elif action == "call_blueprint_function":
         object_path = req.get("objectPath", "")
         function_name = req.get("functionName", "")
@@ -366,7 +345,6 @@ else:
         })
         return result
 
-    # ── Execute Unreal Python ──────────────────────────────────────────────────
     elif action == "execute_unreal_python":
         script = req.get("script", "")
         temp_file = os.path.join(SYNC_FOLDER, "temp_exec.py")
@@ -375,8 +353,8 @@ else:
                 f.write(script)
         except Exception as e:
             return {"status": "error", "message": f"Failed to write temp python file: {str(e)}"}
-            
-        temp_file_ue = temp_file.replace("\\\\", "/")
+
+        temp_file_ue = temp_file.replace("\\", "/")
         result = unreal_remote("/remote/object/call", {
             "objectPath": "/Script/Engine.Default__KismetSystemLibrary",
             "functionName": "ExecuteConsoleCommand",
@@ -387,15 +365,13 @@ else:
         })
         return result
 
-    # ── Trigger sync (write a request file; Blender picks it up) ──────────────
     elif action == "trigger_sync":
         export_type = req.get("type", "ALL")
-        req_path    = os.path.join(SYNC_FOLDER, "request.json")
+        req_path = os.path.join(SYNC_FOLDER, "request.json")
         with open(req_path, "w") as f:
             json.dump({"action": "export", "type": export_type}, f)
         return {"status": "ok", "message": f"Sync request written ({export_type})"}
 
-    # ── Read metadata ─────────────────────────────────────────────────────────
     elif action == "get_metadata":
         meta_path = os.path.join(SYNC_FOLDER, "UnrealMetadata.json")
         if os.path.exists(meta_path):
@@ -403,9 +379,8 @@ else:
                 return {"status": "ok", "metadata": json.load(f)}
         return {"status": "ok", "metadata": {}}
 
-    # ── Write metadata ────────────────────────────────────────────────────────
     elif action == "set_metadata":
-        metadata  = req.get("metadata", {})
+        metadata = req.get("metadata", {})
         meta_path = os.path.join(SYNC_FOLDER, "UnrealMetadata.json")
         existing = {}
         if os.path.exists(meta_path):
@@ -416,17 +391,11 @@ else:
             json.dump(existing, f, indent=2)
         return {"status": "ok", "message": "Metadata saved"}
 
-    # ── Asset list (read from sync folder) ────────────────────────────────────
     elif action == "get_asset_hierarchy":
         result = unreal_remote("/remote/assets", {})
         return result
 
-    # ── Take Screenshot ───────────────────────────────────────────────────────
     elif action == "take_screenshot":
-        import time
-        import base64
-        import glob
-        import shutil
         shot_path = os.path.join(SYNC_FOLDER, "ue_screenshot.png")
         if os.path.exists(shot_path):
             try:
@@ -434,7 +403,6 @@ else:
             except Exception:
                 pass
 
-        # Disable background throttling and trigger HighResShot console command
         ue_script = """import unreal
 unreal.SystemLibrary.execute_console_command(None, "t.IdleWhenNotForeground 0")
 unreal.SystemLibrary.execute_console_command(None, "HighResShot 1280x720")
@@ -447,8 +415,7 @@ unreal.SystemLibrary.execute_console_command(None, "HighResShot 1280x720")
             return {"status": "error", "message": f"Failed to write temp screenshot script: {str(e)}"}
 
         project_screenshots_dir = r"C:\Users\sassy\OneDrive\Documents\Unreal Projects\MyProject\Saved\Screenshots"
-        
-        # Record existing files before triggering screenshot
+
         existing_files = set()
         if os.path.exists(project_screenshots_dir):
             existing_files = set(glob.glob(os.path.join(project_screenshots_dir, "**", "*.png"), recursive=True))
@@ -463,7 +430,6 @@ unreal.SystemLibrary.execute_console_command(None, "HighResShot 1280x720")
             }
         })
 
-        # Poll for any new file appearing in project_screenshots_dir (up to 15 seconds)
         found_file = None
         for _ in range(150):
             if os.path.exists(project_screenshots_dir):
@@ -489,7 +455,7 @@ unreal.SystemLibrary.execute_console_command(None, "HighResShot 1280x720")
         try:
             from PIL import Image
             import io
-            
+
             with Image.open(shot_path) as img:
                 img = img.convert("RGB")
                 width, height = img.size
@@ -499,18 +465,18 @@ unreal.SystemLibrary.execute_console_command(None, "HighResShot 1280x720")
                     new_w = int(width * ratio)
                     new_h = int(height * ratio)
                     img = img.resize((new_w, new_h), Image.Resampling.LANCZOS)
-                
+
                 buffer = io.BytesIO()
                 img.save(buffer, format="JPEG", quality=70)
                 img_bytes = buffer.getvalue()
-                
+
             img_data = base64.b64encode(img_bytes).decode("utf-8")
-            
+
             try:
                 if os.path.exists(shot_path): os.remove(shot_path)
             except Exception:
                 pass
-                
+
             return {"status": "ok", "image_data": img_data}
         except Exception as e:
             try:
@@ -520,7 +486,6 @@ unreal.SystemLibrary.execute_console_command(None, "HighResShot 1280x720")
             except Exception as ex:
                 return {"status": "error", "message": f"Failed to read/encode screenshot: {str(ex)}"}
 
-    # ── Batch Create Actors ───────────────────────────────────────────────────
     elif action == "batch_create_actors":
         actors = req.get("actors", [])
         actors_data_str = json.dumps(actors)
@@ -542,11 +507,11 @@ for item in actors_data:
     loc = item.get("location", {{"x": 0, "y": 0, "z": 0}})
     scl = item.get("scale", {{"x": 1, "y": 1, "z": 1}})
     rot = item.get("rotation", {{"pitch": 0, "yaw": 0, "roll": 0}})
-    
+
     mesh_path = shape_map.get(shape, shape_map["Cube"])
     if mesh_path not in loaded_meshes:
         loaded_meshes[mesh_path] = unreal.EditorAssetLibrary.load_asset(mesh_path)
-    
+
     mesh_obj = loaded_meshes[mesh_path]
     if mesh_obj:
         actor = unreal.EditorLevelLibrary.spawn_actor_from_object(
@@ -563,24 +528,21 @@ unreal.log(f"batch_create_actors: Spawned {{spawned_count}} actor(s)")
 """
         return _exec_ue_script(ue_script, "batch_create_actors")
 
-    # ── Spawn Blockout Primitive ──────────────────────────────────────────────
     elif action == "spawn_blockout_primitive":
         shape = req.get("shape", "Cube").capitalize()
-        name  = req.get("name", "BlockoutActor")
-        loc   = req.get("location", {"x": 0, "y": 0, "z": 0})
-        scl   = req.get("scale", {"x": 1, "y": 1, "z": 1})
+        name = req.get("name", "BlockoutActor")
+        loc = req.get("location", {"x": 0, "y": 0, "z": 0})
+        scl = req.get("scale", {"x": 1, "y": 1, "z": 1})
 
-        # Map shape names to Unreal default static mesh paths
         shape_map = {
-            "Cube":     "/Engine/BasicShapes/Cube.Cube",
-            "Sphere":   "/Engine/BasicShapes/Sphere.Sphere",
+            "Cube": "/Engine/BasicShapes/Cube.Cube",
+            "Sphere": "/Engine/BasicShapes/Sphere.Sphere",
             "Cylinder": "/Engine/BasicShapes/Cylinder.Cylinder",
-            "Cone":     "/Engine/BasicShapes/Cone.Cone",
-            "Plane":    "/Engine/BasicShapes/Plane.Plane",
+            "Cone": "/Engine/BasicShapes/Cone.Cone",
+            "Plane": "/Engine/BasicShapes/Plane.Plane",
         }
         mesh_path = shape_map.get(shape, shape_map["Cube"])
 
-        # Write a temp Python script for Unreal to execute
         ue_script = f"""import unreal
 astatic = unreal.EditorAssetLibrary.load_asset("{mesh_path}")
 if astatic:
@@ -609,11 +571,10 @@ else:
         result["shape"] = shape
         return result
 
-    # ── Import FBX ────────────────────────────────────────────────────────────
     elif action == "import_fbx":
-        filename    = req.get("filename", "")
+        filename = req.get("filename", "")
         destination = req.get("destination", "/Game/BlenderSync/")
-        fbx_path    = os.path.join(SYNC_FOLDER, filename)
+        fbx_path = os.path.join(SYNC_FOLDER, filename)
 
         if not os.path.exists(fbx_path):
             return {"status": "error", "message": f"FBX file not found: {fbx_path}"}
@@ -646,7 +607,6 @@ unreal.log("Imported FBX: {filename} -> {destination}")
         result["destination"] = destination
         return result
 
-    # ── Import Animation ──────────────────────────────────────────────────────
     elif action == "import_animation_to_unreal":
         filepath = req.get("filepath")
         destination_path = req.get("destination_path", "/Game/Animations")
@@ -654,7 +614,7 @@ unreal.log("Imported FBX: {filename} -> {destination}")
 
         if not filepath or not skeleton_path:
             return {"status": "error", "message": "filepath and skeleton_path required"}
-            
+
         filepath_ue = filepath.replace("\\", "/")
         ue_script = f"""import unreal
 task = unreal.AssetImportTask()
@@ -676,7 +636,6 @@ unreal.log("Imported animation: {filepath_ue} -> {destination_path}")
 """
         return _exec_ue_script(ue_script, "import_animation_to_unreal")
 
-    # ── Create Landscape ──────────────────────────────────────────────────────
     elif action == "create_landscape":
         loc = req.get("location", {"x": 0, "y": 0, "z": 0})
         scl = req.get("scale", {"x": 100, "y": 100, "z": 100})
@@ -698,7 +657,6 @@ if mat and landscape:
         ue_script = f"""import unreal
 import struct
 
-# Calculate total resolution
 quads_per_section = {section_size}
 sections = {sections_per}
 num_comp_x = {num_x}
@@ -706,10 +664,8 @@ num_comp_y = {num_y}
 size_x = quads_per_section * sections * num_comp_x + 1
 size_y = quads_per_section * sections * num_comp_y + 1
 
-# Create flat heightmap data (mid-height = 32768 for 16-bit)
 height_data = [32768] * (size_x * size_y)
 
-# Create the landscape proxy
 world = unreal.EditorLevelLibrary.get_editor_world()
 landscape = unreal.EditorLevelLibrary.spawn_actor_from_class(
     unreal.LandscapeStreamingProxy if False else unreal.Landscape,
@@ -724,7 +680,6 @@ else:
 """
         return _exec_ue_script(ue_script, "create_landscape")
 
-    # ── Import Heightmap ─────────────────────────────────────────────────────
     elif action == "import_heightmap":
         filename = req.get("filename", "")
         landscape_name = req.get("landscape_name", "Landscape")
@@ -735,7 +690,6 @@ else:
 
         ue_script = f"""import unreal
 
-# Find landscape
 actors = unreal.EditorLevelLibrary.get_all_level_actors()
 landscape = None
 for a in actors:
@@ -746,7 +700,6 @@ for a in actors:
 if not landscape:
     unreal.log_warning("Landscape '{landscape_name}' not found.")
 else:
-    # Use the LandscapeEditorLibrary or console command to import
     unreal.SystemLibrary.execute_console_command(
         None,
         'Landscape.ImportHeightmap filename="{hm_path}"'
@@ -755,7 +708,6 @@ else:
 """
         return _exec_ue_script(ue_script, "import_heightmap")
 
-    # ── Export Heightmap ──────────────────────────────────────────────────────
     elif action == "export_heightmap":
         landscape_name = req.get("landscape_name", "Landscape")
         filename = req.get("filename", "landscape_heightmap.png")
@@ -781,12 +733,9 @@ else:
 """
         return _exec_ue_script(ue_script, "export_heightmap")
 
-    # ── Sculpt Landscape ─────────────────────────────────────────────────────
     elif action == "sculpt_landscape":
         points = req.get("points", [])
         landscape_name = req.get("landscape_name", "Landscape")
-
-        # Build Python list of sculpt ops
         points_str = json.dumps(points)
         ue_script = f"""import unreal
 import json
@@ -809,13 +758,11 @@ else:
             subsystem.sculpt(loc, pt.get("radius", 1000), pt.get("strength", 0.5))
         unreal.log(f"Sculpted {{len(points)}} points on landscape.")
     else:
-        # Fallback: modify via heightmap data directly
-        unreal.log_warning("LandscapeEditorSubsystem not available. Use execute_unreal_python with custom heightmap manipulation for advanced sculpting.")
-        unreal.log(f"Requested sculpt at {{len(points)}} points - manual approach required in this UE version.")
+        unreal.log_warning("LandscapeEditorSubsystem not available.")
+        unreal.log(f"Requested sculpt at {{len(points)}} points - manual approach required.")
 """
         return _exec_ue_script(ue_script, "sculpt_landscape")
 
-    # ── Paint Landscape Layer ────────────────────────────────────────────────
     elif action == "paint_landscape_layer":
         layer_name = req.get("layer_name", "")
         points = req.get("points", [])
@@ -843,11 +790,10 @@ else:
             subsystem.paint_layer("{layer_name}", loc, pt.get("radius", 1000), pt.get("strength", 1.0))
         unreal.log(f"Painted {{len(points)}} points with layer '{layer_name}'.")
     else:
-        unreal.log_warning("LandscapeEditorSubsystem not available for painting in this UE version.")
+        unreal.log_warning("LandscapeEditorSubsystem not available.")
 """
         return _exec_ue_script(ue_script, "paint_landscape_layer")
 
-    # ── Set Landscape Material ───────────────────────────────────────────────
     elif action == "set_landscape_material":
         material_path = req.get("material_path", "")
         landscape_name = req.get("landscape_name", "Landscape")
@@ -873,7 +819,6 @@ else:
 """
         return _exec_ue_script(ue_script, "set_landscape_material")
 
-    # ── Get Landscape Info ───────────────────────────────────────────────────
     elif action == "get_landscape_info":
         landscape_name = req.get("landscape_name", "Landscape")
 
@@ -893,10 +838,10 @@ else:
     loc = landscape.get_actor_location()
     scl = landscape.get_actor_scale3d()
     bounds_origin, bounds_extent = landscape.get_actor_bounds(False)
-    
+
     mat = landscape.get_editor_property("landscape_material")
     mat_name = mat.get_path_name() if mat else "None"
-    
+
     info = {{
         "name": landscape.get_actor_label(),
         "location": {{"x": loc.x, "y": loc.y, "z": loc.z}},
@@ -909,11 +854,9 @@ else:
 """
         return _exec_ue_script(ue_script, "get_landscape_info")
 
-    # ── Add Foliage ──────────────────────────────────────────────────────────
     elif action == "add_foliage":
         foliage_type = req.get("foliage_type", "")
         instances = req.get("instances", [])
-        align = req.get("align_to_surface", True)
         instances_str = json.dumps(instances)
 
         ue_script = f"""import unreal
@@ -924,26 +867,23 @@ mesh = unreal.EditorAssetLibrary.load_asset("{foliage_type}")
 if not mesh:
     unreal.log_warning("Foliage asset not found: {foliage_type}")
 else:
-    # Get or create the Instanced Foliage Actor
     world = unreal.EditorLevelLibrary.get_editor_world()
-    
+
     for inst in instances:
         loc = unreal.Vector(inst.get("x", 0), inst.get("y", 0), inst.get("z", 0))
         rot = unreal.Rotator(inst.get("pitch", 0), inst.get("yaw", 0), inst.get("roll", 0))
         scale_val = inst.get("scale", 1.0)
-        
-        # Spawn as a static mesh actor (simplest cross-version approach)
+
         actor = unreal.EditorLevelLibrary.spawn_actor_from_object(mesh, loc)
         if actor:
             actor.set_actor_rotation(rot, False)
             actor.set_actor_scale3d(unreal.Vector(scale_val, scale_val, scale_val))
             actor.set_folder_path("Foliage")
-    
+
     unreal.log(f"Placed {{len(instances)}} foliage instances of {foliage_type}")
 """
         return _exec_ue_script(ue_script, "add_foliage")
 
-    # ── Remove Foliage ───────────────────────────────────────────────────────
     elif action == "remove_foliage":
         x = req.get("x", 0)
         y = req.get("y", 0)
@@ -969,7 +909,6 @@ unreal.log(f"Removed {{removed}} foliage actors within radius {radius}")
 """
         return _exec_ue_script(ue_script, "remove_foliage")
 
-    # ── Mesh Boolean ─────────────────────────────────────────────────────────
     elif action == "mesh_boolean":
         target = req.get("target_actor", "")
         tool = req.get("tool_actor", "")
@@ -991,14 +930,12 @@ if not target_actor:
 elif not tool_actor:
     unreal.log_warning("Tool actor '{tool}' not found.")
 else:
-    # Use Geometry Script if available (UE 5.x)
     try:
         geo_lib = unreal.GeometryScriptLibrary
         unreal.log("GeometryScript available - boolean operations supported in Modeling Mode.")
     except:
         pass
-    
-    # Fallback: select both actors and use editor command
+
     unreal.EditorLevelLibrary.set_selected_level_actors([target_actor, tool_actor])
     op_map = {{"subtract": "MeshBooleanSubtract", "union": "MeshBooleanUnion", "intersect": "MeshBooleanIntersect"}}
     cmd = op_map.get("{operation}", "MeshBooleanSubtract")
@@ -1007,7 +944,6 @@ else:
 """
         return _exec_ue_script(ue_script, "mesh_boolean")
 
-    # ── Generate Mesh from Spline ────────────────────────────────────────────
     elif action == "generate_mesh_from_spline":
         name = req.get("name", "SplineMesh")
         spline_points = req.get("spline_points", [])
@@ -1015,20 +951,17 @@ else:
         closed = req.get("closed", False)
         points_str = json.dumps(spline_points)
 
-        ue_script = f"""import unreal
-import json
+        ue_script = f"""import unreal, json
 
 points = json.loads('{points_str}')
 
-# Create a SplineComponent-based actor
 actor = unreal.EditorLevelLibrary.spawn_actor_from_class(
     unreal.Actor,
     unreal.Vector(0, 0, 0)
 )
 if actor:
     actor.set_actor_label("{name}")
-    
-    # Add a spline component
+
     spline = actor.add_component_by_class(unreal.SplineComponent, False, unreal.Transform(), False)
     if spline:
         spline.clear_spline_points()
@@ -1041,12 +974,11 @@ if actor:
         spline.set_closed_loop({str(closed)})
         spline.update_spline()
         unreal.log(f"Created spline '{{actor.get_actor_label()}}' with {{len(points)}} points, width={width}")
-    
+
     actor.set_folder_path("GeneratedMeshes")
 """
         return _exec_ue_script(ue_script, "generate_mesh_from_spline")
 
-    # ── PCG Component Creation ────────────────────────────────────────────────
     elif action == "create_pcg_component":
         actor_name = req.get("actor_name", "")
         graph_path = req.get("graph_path", "")
@@ -1098,7 +1030,6 @@ if actor and pcg_graph:
 """
         return _exec_ue_script(ue_script, "create_pcg_component")
 
-    # ── PCG Generate ──────────────────────────────────────────────────────────
     elif action == "pcg_generate":
         actor_name = req.get("actor_name", "")
         ue_script = f"""import unreal
@@ -1114,7 +1045,6 @@ for a in actors:
 """
         return _exec_ue_script(ue_script, "pcg_generate")
 
-    # ── PCG Cleanup ───────────────────────────────────────────────────────────
     elif action == "pcg_cleanup":
         actor_name = req.get("actor_name", "")
         ue_script = f"""import unreal
@@ -1130,7 +1060,6 @@ for a in actors:
 """
         return _exec_ue_script(ue_script, "pcg_cleanup")
 
-    # ── PCG Set Parameter ─────────────────────────────────────────────────────
     elif action == "pcg_set_parameter":
         actor_name = req.get("actor_name", "")
         param_name = req.get("parameter_name", "")
@@ -1160,7 +1089,6 @@ if pcg_comp:
     if graph_instance:
         try:
             helpers = unreal.PCGGraphParametersHelpers
-            # Auto-detect if type not explicitly specified
             if val_type == "float" or (not val_type and isinstance(val_json, float)):
                 helpers.set_float_parameter(graph_instance, param_name, float(val_json))
             elif val_type == "int" or (not val_type and isinstance(val_json, int) and not isinstance(val_json, bool)):
@@ -1189,7 +1117,6 @@ if pcg_comp:
 """
         return _exec_ue_script(ue_script, "pcg_set_parameter")
 
-    # ── PCG Get Parameters ────────────────────────────────────────────────────
     elif action == "pcg_get_parameters":
         actor_name = req.get("actor_name", "")
         ue_script = f"""import unreal, json
@@ -1211,7 +1138,7 @@ for a in actors:
             }}
         break
 
-out_path = "{SYNC_FOLDER.replace('\\\\', '/')}/pcg_info.json"
+out_path = f"{SYNC_FOLDER_FWD}/pcg_info.json"
 with open(out_path, "w", encoding="utf-8") as f:
     json.dump(info, f)
 """
@@ -1221,11 +1148,10 @@ with open(out_path, "w", encoding="utf-8") as f:
             try:
                 with open(info_file, "r", encoding="utf-8") as f:
                     return json.load(f)
-            except:
+            except Exception:
                 pass
         return {"status": "ok"}
 
-    # ── Precision Align Actors ────────────────────────────────────────────────
     elif action == "align_actors":
         actor_a_name = req.get("actor_a_name", "")
         actor_b_name = req.get("actor_b_name", "")
@@ -1249,10 +1175,10 @@ for a in actors:
 if actor_a and actor_b:
     origin_a, extent_a = actor_a.get_actor_bounds(False)
     origin_b, extent_b = actor_b.get_actor_bounds(False)
-    
+
     loc_b = actor_b.get_actor_location()
     new_loc = unreal.Vector(loc_b.x, loc_b.y, loc_b.z)
-    
+
     if axis == "+X":
         new_loc.x = origin_a.x + extent_a.x + extent_b.x + offset
     elif axis == "-X":
@@ -1265,13 +1191,12 @@ if actor_a and actor_b:
         new_loc.z = origin_a.z + extent_a.z + extent_b.z + offset
     elif axis == "-Z":
         new_loc.z = origin_a.z - extent_a.z - extent_b.z - offset
-        
+
     actor_b.set_actor_location(new_loc, False, True)
     unreal.log(f"Aligned {{actor_b_name}} with {{actor_a_name}} along {{axis}} (new_loc: {{new_loc}})")
 """
         return _exec_ue_script(ue_script, "align_actors")
 
-    # ── Get Actor Dimensions ──────────────────────────────────────────────────
     elif action == "get_actor_dimensions":
         actor_name = req.get("actor_name", "")
 
@@ -1305,7 +1230,7 @@ for a in actors:
         }}
         break
 
-out_path = "{SYNC_FOLDER.replace('\\\\', '/')}/actor_dimensions.json"
+out_path = f"{SYNC_FOLDER_FWD}/actor_dimensions.json"
 with open(out_path, "w", encoding="utf-8") as f:
     json.dump(result, f)
 """
@@ -1319,7 +1244,6 @@ with open(out_path, "w", encoding="utf-8") as f:
                 pass
         return {"status": "error", "message": "Failed to read dimensions"}
 
-    # ── Snap to Grid ──────────────────────────────────────────────────────────
     elif action == "snap_to_grid":
         actor_name = req.get("actor_name", "")
         grid_size = req.get("grid_size", 100.0)
@@ -1346,7 +1270,6 @@ for a in actors:
 """
         return _exec_ue_script(ue_script, "snap_to_grid")
 
-    # ── Verify Actor Alignment ────────────────────────────────────────────────
     elif action == "verify_actor_alignment":
         actor_a_name = req.get("actor_a_name", "")
         actor_b_name = req.get("actor_b_name", "")
@@ -1382,15 +1305,14 @@ if actor_a and actor_b:
         b_min = origin_b.y - extent_b.y
         a_min = origin_a.y - extent_a.y
         b_max = origin_b.y + extent_b.y
-    else:  # Z
+    else:
         a_max = origin_a.z + extent_a.z
         b_min = origin_b.z - extent_b.z
         a_min = origin_a.z - extent_a.z
         b_max = origin_b.z + extent_b.z
 
-    # gap > 0 means apart, < 0 means overlap, == 0 means perfect touch
-    gap_ab = b_min - a_max   # B's near face minus A's far face
-    gap_ba = a_min - b_max   # A's near face minus B's far face
+    gap_ab = b_min - a_max
+    gap_ba = a_min - b_max
 
     if gap_ab >= -0.1 and gap_ab <= 0.1:
         status_str = "TOUCHING_PERFECTLY"
@@ -1416,7 +1338,7 @@ if actor_a and actor_b:
         "is_correct": status_str in ("TOUCHING_PERFECTLY", "TOUCHING_PERFECTLY_REVERSED")
     }}
 
-out_path = "{SYNC_FOLDER.replace('\\\\', '/')}/alignment_check.json"
+out_path = f"{SYNC_FOLDER_FWD}/alignment_check.json"
 with open(out_path, "w", encoding="utf-8") as f:
     json.dump(result, f)
 """
@@ -1430,7 +1352,6 @@ with open(out_path, "w", encoding="utf-8") as f:
                 pass
         return {"status": "error", "message": "Failed to read alignment check"}
 
-    # ── Blueprint Tools ───────────────────────────────────────────────────────
     elif action == "create_blueprint_class":
         class_name = req.get("class_name", "")
         parent_class = req.get("parent_class", "Actor")
@@ -1475,7 +1396,7 @@ if bp and comp_class:
         property_value = req.get("property_value", "")
         try:
             val = json.loads(property_value)
-        except:
+        except Exception:
             val = property_value
         property_value_repr = repr(val)
         ue_script = f"""import unreal
@@ -1530,7 +1451,6 @@ with open('{sync_folder_fwd}/bp_info.json', 'w') as f:
         except Exception:
             return {"status": "error", "message": "Failed to read result"}
 
-    # ── Material Tools ────────────────────────────────────────────────────────
     elif action == "create_material_asset":
         material_name = req.get("material_name", "")
         save_path = req.get("save_path", "/Game/Materials")
@@ -1639,7 +1559,6 @@ unreal.SystemLibrary.execute_console_command(world, 'r.Lumen.Reflections.Allow {
 """
         return _exec_ue_script(ue_script, action)
 
-    # ── Sequencer Tools ───────────────────────────────────────────────────────
     elif action == "create_level_sequence":
         sequence_name = req.get("sequence_name", "")
         save_path = req.get("save_path", "/Game/Sequences")
@@ -1695,7 +1614,6 @@ if seq:
 """
         return _exec_ue_script(ue_script, action)
 
-    # ── Niagara VFX Tools ─────────────────────────────────────────────────────
     elif action == "spawn_niagara_system":
         system_path = req.get("system_path", "")
         actor_name = req.get("actor_name", "")
@@ -1759,7 +1677,6 @@ for a in unreal.EditorLevelLibrary.get_all_level_actors():
 """
         return _exec_ue_script(ue_script, action)
 
-    # ── World & Level Tools ───────────────────────────────────────────────────
     elif action == "run_console_command":
         command = req.get("command", "")
         ue_script = f"""import unreal
@@ -1835,7 +1752,6 @@ ppv.set_editor_property('unbound', {unbound_py})
 """
         return _exec_ue_script(ue_script, action)
 
-    # ── Asset Management Tools ────────────────────────────────────────────────
     elif action == "list_assets_by_class":
         asset_class = req.get("asset_class", "StaticMesh")
         search_path = req.get("search_path", "/Game")
@@ -1920,7 +1836,6 @@ unreal.EditorAssetLibrary.make_directory('{folder_path}')
 """
         return _exec_ue_script(ue_script, action)
 
-    # ── Physics & Collision Tools ─────────────────────────────────────────────
     elif action == "set_actor_physics":
         actor_name = req.get("actor_name", "")
         phys_py = str(req.get("enabled", False))
@@ -1994,74 +1909,3 @@ for a in unreal.EditorLevelLibrary.get_all_level_actors():
 
     else:
         return {"status": "error", "message": f"Unknown action: {action}"}
-
-
-def handle_client(client_socket: socket.socket):
-    """Handle one incoming connection from the MCP bridge."""
-    try:
-        chunks = []
-        while True:
-            chunk = client_socket.recv(65536)
-            if not chunk:
-                break
-            chunks.append(chunk)
-            # Stop when we have a complete JSON payload
-            try:
-                json.loads(b"".join(chunks).decode("utf-8"))
-                break   # valid JSON received
-            except json.JSONDecodeError:
-                continue  # keep reading
-
-        raw = b"".join(chunks).decode("utf-8").strip()
-        if not raw:
-            send_response(client_socket, {"status": "error", "message": "Empty request"})
-            return
-
-        req = json.loads(raw)
-
-        # Auth check
-        if req.get("auth_token") != AUTH_TOKEN:
-            send_response(client_socket, {"status": "error", "message": "Invalid auth token"})
-            return
-
-        action = req.get("action", "")
-        print(f"[UnrealServer] Action: {action}")
-
-        result = handle_action(req)
-        send_response(client_socket, result)
-
-    except Exception as exc:
-        send_response(client_socket, {"status": "error", "message": str(exc)})
-    finally:
-        client_socket.close()
-
-
-def send_response(sock: socket.socket, data: dict):
-    raw = json.dumps(data).encode("utf-8")
-    sock.sendall(raw)
-
-
-def main():
-    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    server.bind((LISTEN_HOST, LISTEN_PORT))
-    server.listen(16)
-    print(f"[UnrealServer] Listening on {LISTEN_HOST}:{LISTEN_PORT}")
-    print(f"[UnrealServer] Forwarding to Unreal Remote Control on port {UNREAL_PORT}")
-    print(f"[UnrealServer] Sync folder: {SYNC_FOLDER}")
-    print("[UnrealServer] Ready. Keep this window open while using AI tools.")
-    print("-" * 60)
-
-    try:
-        while True:
-            client_sock, addr = server.accept()
-            print(f"[UnrealServer] Connection from {addr}")
-            t = threading.Thread(target=handle_client, args=(client_sock,), daemon=True)
-            t.start()
-    except KeyboardInterrupt:
-        print("\n[UnrealServer] Shutting down.")
-        server.close()
-
-
-if __name__ == "__main__":
-    main()

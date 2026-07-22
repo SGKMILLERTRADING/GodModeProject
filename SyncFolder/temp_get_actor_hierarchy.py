@@ -10,6 +10,6 @@ for a in actors:
             "class": a.get_class().get_name(),
             "location": {"x": loc.x, "y": loc.y, "z": loc.z}
         })
-out_path = "C:\Users\sassy\OneDrive\Desktop\Unreal and Blender plugin and extension\SyncFolder/actor_hierarchy.json"
+out_path = f"C:/Users/sassy/OneDrive/Desktop/Unreal and Blender plugin and extension/SyncFolder/actor_hierarchy.json"
 with open(out_path, "w", encoding="utf-8") as f:
     json.dump(out, f)

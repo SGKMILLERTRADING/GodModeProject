@@ -1041,19 +1041,22 @@ def send(obj: dict):
     sys.stdout.flush()
 
 def error_response(req_id, code: int, message: str):
-    send({"jsonrpc": "2.0", "id": req_id, "error": {"code": code, "message": message}})
+    if req_id is not None:
+        send({"jsonrpc": "2.0", "id": req_id, "error": {"code": code, "message": message}})
 
 
 UNREAL_HOST = "127.0.0.1"
 UNREAL_PORT = 8001
 AUTH_TOKEN = "d9a7f3e8b6c04a92a5f2e1c4b9d7e3a1"
 
+from unreal_actions import handle_action
+
 # All tools that should be routed to Unreal instead of Blender
 _UNREAL_TOOLS = frozenset([
     "get_actor_hierarchy", "create_actor", "delete_actor", "set_transform",
     "trigger_sync", "get_metadata", "set_metadata", "get_asset_hierarchy",
     "run_editor_command", "get_actor_property", "set_actor_property",
-    "call_blueprint_function", "execute_unreal_python", "take_screenshot",
+    "call_blueprint_function", "execute_unreal_python", "take_screenshot", "capture_unreal_viewport",
     "spawn_blockout_primitive", "batch_create_actors", "import_fbx",
     "create_landscape", "import_heightmap", "export_heightmap",
     "sculpt_landscape", "paint_landscape_layer", "set_landscape_material",
@@ -1062,41 +1065,46 @@ _UNREAL_TOOLS = frozenset([
     "create_pcg_component", "pcg_generate", "pcg_cleanup",
     "pcg_set_parameter", "pcg_get_parameters",
     "align_actors", "get_actor_dimensions", "snap_to_grid", "verify_actor_alignment",
+    "create_blueprint_class", "compile_blueprint", "add_blueprint_component", 
+    "set_blueprint_default_value", "reparent_blueprint", "get_blueprint_info",
+    "create_material_asset", "create_material_instance", "set_material_scalar_param", 
+    "set_material_vector_param", "set_material_texture_param", "set_nanite_enabled", 
+    "set_actor_material", "apply_lumen_settings", "create_level_sequence", 
+    "add_actor_to_sequence", "open_level_sequence", "set_sequence_length", 
+    "spawn_niagara_system", "set_niagara_float", "set_niagara_bool", 
+    "set_niagara_vector", "run_console_command", "save_current_level", 
+    "set_world_gravity", "spawn_sky_atmosphere", "spawn_directional_light", 
+    "spawn_exponential_fog", "create_post_process_volume", "list_assets_by_class", 
+    "duplicate_asset", "delete_asset", "rename_asset", "find_actors_by_tag", 
+    "set_actor_tag", "create_content_folder", "set_actor_physics", 
+    "set_collision_profile", "generate_mesh_collision", "remove_mesh_collision", 
+    "set_actor_mass"
 ])
 
 def call_unreal(action: str, extra: dict) -> dict:
-    payload = {"auth_token": AUTH_TOKEN, "action": action, **extra}
-    raw = json.dumps(payload).encode("utf-8")
-    try:
-        with socket.create_connection((UNREAL_HOST, UNREAL_PORT), timeout=10) as sock:
-            sock.sendall(raw)
-            sock.shutdown(socket.SHUT_WR)  # Signal EOF so server stops reading
-            chunks = []
-            while True:
-                chunk = sock.recv(65536)
-                if not chunk:
-                    break
-                chunks.append(chunk)
-            response_raw = b"".join(chunks).decode("utf-8", errors="replace")
-            if not response_raw.strip():
-                return {"status": "error", "message": "Empty response from Unreal"}
-            return json.loads(response_raw)
-    except Exception as exc:
-        return {"status": "error", "message": f"Unreal connection error: {str(exc)}"}
+    """Call Unreal Engine directly via HTTP Remote Control (no socket server needed)."""
+    req = {"action": action, **extra}
+    return handle_action(req)
 
 
-def handle_tool(name: str, args: dict) -> list:
-    """Map MCP tool name -> Blender or Unreal action"""
+def handle_tool(name: str, args: dict) -> tuple:
+    """Map MCP tool name -> Blender or Unreal action. Returns (content_list, is_error)."""
     if name in _UNREAL_TOOLS:
         result = call_unreal(name, args)
     else:
         result = call_blender(name, args)
+
+    is_error = False
+    if isinstance(result, dict) and result.get("status") == "error":
+        is_error = True
+
     if name == "take_screenshot" and isinstance(result, dict) and "image_data" in result:
-        return [{"type": "image", "data": result["image_data"], "mimeType": "image/png"}]
+        return [{"type": "image", "data": result["image_data"], "mimeType": "image/png"}], is_error
+
     res_str = json.dumps(result, indent=2)
     if len(res_str) > 800000:
         res_str = res_str[:800000] + "\n... [Output truncated to stay under 1MB Claude Desktop limit]"
-    return [{"type": "text", "text": res_str}]
+    return [{"type": "text", "text": res_str}], is_error
 
 
 def main():
@@ -1114,36 +1122,40 @@ def main():
         params = req.get("params", {})
 
         if method == "initialize":
-            send({
-                "jsonrpc": "2.0",
-                "id": req_id,
-                "result": {
-                    "protocolVersion": "2024-11-05",
-                    "capabilities": {"tools": {}},
-                    "serverInfo": {"name": "BlenderMCPBridge", "version": "1.0.0"}
-                }
-            })
-        elif method == "notifications/initialized":
-            pass
-        elif method == "tools/list":
-            send({"jsonrpc": "2.0", "id": req_id, "result": {"tools": TOOLS}})
-        elif method == "tools/call":
-            tool_name = params.get("name", "")
-            tool_args  = params.get("arguments", {})
-            try:
-                content = handle_tool(tool_name, tool_args)
+            if req_id is not None:
                 send({
                     "jsonrpc": "2.0",
                     "id": req_id,
                     "result": {
-                        "content": content,
-                        "isError": False
+                        "protocolVersion": "2024-11-05",
+                        "capabilities": {"tools": {}},
+                        "serverInfo": {"name": "BlenderMCPBridge", "version": "1.0.0"}
                     }
                 })
+        elif method == "notifications/initialized":
+            pass
+        elif method == "tools/list":
+            if req_id is not None:
+                send({"jsonrpc": "2.0", "id": req_id, "result": {"tools": TOOLS}})
+        elif method == "tools/call":
+            tool_name = params.get("name", "")
+            tool_args  = params.get("arguments", {})
+            try:
+                content, is_error = handle_tool(tool_name, tool_args)
+                if req_id is not None:
+                    send({
+                        "jsonrpc": "2.0",
+                        "id": req_id,
+                        "result": {
+                            "content": content,
+                            "isError": is_error
+                        }
+                    })
             except Exception:
                 error_response(req_id, -32000, traceback.format_exc())
         else:
-            send({"jsonrpc": "2.0", "id": req_id, "result": {}})
+            if req_id is not None:
+                send({"jsonrpc": "2.0", "id": req_id, "result": {}})
 
 if __name__ == "__main__":
     main()

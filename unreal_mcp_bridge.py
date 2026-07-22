@@ -1107,37 +1107,11 @@ TOOLS = [
 ]
 
 # --------------------------------------------------------------------------
-# Send a request to the Unreal socket server
-# --------------------------------------------------------------------------
+from unreal_actions import handle_action
+
 def call_unreal(action: str, extra: dict) -> dict:
-    payload = {"auth_token": AUTH_TOKEN, "action": action, **extra}
-    raw = json.dumps(payload).encode("utf-8")
-    try:
-        with socket.create_connection((UNREAL_HOST, UNREAL_PORT), timeout=10) as sock:
-            sock.sendall(raw)
-            sock.shutdown(socket.SHUT_WR)  # Signal EOF so server stops reading
-            # Read response (up to 1 MB)
-            chunks = []
-            while True:
-                chunk = sock.recv(65536)
-                if not chunk:
-                    break
-                chunks.append(chunk)
-            response_raw = b"".join(chunks).decode("utf-8", errors="replace")
-            
-            if not response_raw.strip():
-                return {"status": "error", "message": "Empty response received from socket server."}
-                
-            try:
-                return json.loads(response_raw)
-            except json.JSONDecodeError as e:
-                import sys
-                print(f"RAW RESPONSE ERROR: {repr(response_raw)}", file=sys.stderr)
-                return {"status": "error", "message": f"Invalid JSON from socket server: {str(e)}"}
-    except ConnectionRefusedError:
-        return {"status": "error", "message": f"Cannot connect to Unreal on port {UNREAL_PORT}. Is the editor running with the plugin loaded?"}
-    except Exception as exc:
-        return {"status": "error", "message": str(exc)}
+    req = {"action": action, **extra}
+    return handle_action(req)
 
 # --------------------------------------------------------------------------
 # MCP JSON-RPC helpers
@@ -1147,13 +1121,14 @@ def send(obj: dict):
     sys.stdout.flush()
 
 def error_response(req_id, code: int, message: str):
-    send({"jsonrpc": "2.0", "id": req_id, "error": {"code": code, "message": message}})
+    if req_id is not None:
+        send({"jsonrpc": "2.0", "id": req_id, "error": {"code": code, "message": message}})
 
 # --------------------------------------------------------------------------
 # Handle individual tool calls
 # --------------------------------------------------------------------------
-def handle_tool(name: str, args: dict) -> list:
-    """Map MCP tool name -> Unreal action, call, return result as list of content blocks."""
+def handle_tool(name: str, args: dict) -> tuple:
+    """Map MCP tool name -> Unreal action, call, return (result, is_error)."""
     if name == "get_actor_hierarchy":
         result = call_unreal("get_actor_hierarchy", {})
     elif name == "create_actor":
@@ -1182,17 +1157,13 @@ def handle_tool(name: str, args: dict) -> list:
         result = call_unreal("execute_unreal_python", args)
     elif name == "take_screenshot":
         result = call_unreal("take_screenshot", {})
+        is_error = isinstance(result, dict) and result.get("status") == "error"
         if isinstance(result, dict) and "image_data" in result:
-            return [{"type": "image", "data": result["image_data"], "mimeType": "image/png"}]
+            return [{"type": "image", "data": result["image_data"], "mimeType": "image/png"}], is_error
     elif name == "spawn_blockout_primitive":
         result = call_unreal("spawn_blockout_primitive", args)
     elif name == "batch_create_actors":
-        actors = args.get("actors", [])
-        results = []
-        for actor_def in actors:
-            r = call_unreal("spawn_blockout_primitive", actor_def)
-            results.append(r)
-        result = {"status": "ok", "created": len(results), "results": results}
+        result = call_unreal("batch_create_actors", args)
     elif name == "import_fbx":
         result = call_unreal("import_fbx", args)
     elif name in ("create_landscape", "import_heightmap", "export_heightmap",
@@ -1220,10 +1191,14 @@ def handle_tool(name: str, args: dict) -> list:
     else:
         result = {"status": "error", "message": f"Unknown tool: {name}"}
 
+    is_error = False
+    if isinstance(result, dict) and result.get("status") == "error":
+        is_error = True
+
     res_str = json.dumps(result, indent=2)
     if len(res_str) > 800000:
         res_str = res_str[:800000] + "\n... [Output truncated to stay under 1MB Claude Desktop limit]"
-    return [{"type": "text", "text": res_str}]
+    return [{"type": "text", "text": res_str}], is_error
 
 # --------------------------------------------------------------------------
 # Main stdio loop
@@ -1244,43 +1219,47 @@ def main():
 
         # ---- Handshake ----
         if method == "initialize":
-            send({
-                "jsonrpc": "2.0",
-                "id": req_id,
-                "result": {
-                    "protocolVersion": "2024-11-05",
-                    "capabilities": {"tools": {}},
-                    "serverInfo": {"name": "UnrealMCPBridge", "version": "1.0.0"}
-                }
-            })
+            if req_id is not None:
+                send({
+                    "jsonrpc": "2.0",
+                    "id": req_id,
+                    "result": {
+                        "protocolVersion": "2024-11-05",
+                        "capabilities": {"tools": {}},
+                        "serverInfo": {"name": "UnrealMCPBridge", "version": "1.0.0"}
+                    }
+                })
 
         elif method == "notifications/initialized":
             pass   # no response needed
 
         # ---- Tool listing ----
         elif method == "tools/list":
-            send({"jsonrpc": "2.0", "id": req_id, "result": {"tools": TOOLS}})
+            if req_id is not None:
+                send({"jsonrpc": "2.0", "id": req_id, "result": {"tools": TOOLS}})
 
         # ---- Tool execution ----
         elif method == "tools/call":
             tool_name = params.get("name", "")
             tool_args  = params.get("arguments", {})
             try:
-                content = handle_tool(tool_name, tool_args)
-                send({
-                    "jsonrpc": "2.0",
-                    "id": req_id,
-                    "result": {
-                        "content": content,
-                        "isError": False
-                    }
-                })
+                content, is_error = handle_tool(tool_name, tool_args)
+                if req_id is not None:
+                    send({
+                        "jsonrpc": "2.0",
+                        "id": req_id,
+                        "result": {
+                            "content": content,
+                            "isError": is_error
+                        }
+                    })
             except Exception:
                 error_response(req_id, -32000, traceback.format_exc())
 
         else:
             # Unknown method – return empty result so client doesn't hang
-            send({"jsonrpc": "2.0", "id": req_id, "result": {}})
+            if req_id is not None:
+                send({"jsonrpc": "2.0", "id": req_id, "result": {}})
 
 if __name__ == "__main__":
     main()
