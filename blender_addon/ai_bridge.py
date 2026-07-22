@@ -90,7 +90,19 @@ def process_execution_queue():
             
             try:
                 if action == "get_scene_hierarchy":
-                    objects = [{"name": obj.name, "type": obj.type} for obj in bpy.context.scene.objects]
+                    objects = []
+                    for obj in bpy.context.scene.objects:
+                        loc = [round(v, 4) for v in obj.location]
+                        rot = [round(v, 4) for v in obj.rotation_euler]
+                        scl = [round(v, 4) for v in obj.scale]
+                        objects.append({
+                            "name": obj.name,
+                            "type": obj.type,
+                            "location": loc,
+                            "rotation": rot,
+                            "scale": scl,
+                            "parent": obj.parent.name if obj.parent else None
+                        })
                     result_queue.put({"status": "success", "data": objects})
                     
                 elif action == "trigger_sync":
@@ -1144,6 +1156,13 @@ def process_execution_queue():
                     result_queue.put({"status": "error", "message": f"Unknown action: {action}"})
             except Exception as e:
                 result_queue.put({"status": "error", "message": str(e)})
+            finally:
+                # Reset mode to OBJECT if left in EDIT/POSE mode so context stays clean for next call
+                if hasattr(bpy.context, 'mode') and bpy.context.mode != 'OBJECT':
+                    try:
+                        bpy.ops.object.mode_set(mode='OBJECT')
+                    except Exception:
+                        pass
                 
     except queue.Empty:
         pass
